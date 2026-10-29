@@ -1,0 +1,50 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: moveinsync-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: moveinsync_roster
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d moveinsync_roster"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - moveinsync_net
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: moveinsync-roster-api
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      APP_ENV: production
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@db:5432/moveinsync_roster
+      DATABASE_SYNC_URL: postgresql+psycopg://postgres:postgres@db:5432/moveinsync_roster
+      JWT_SECRET_KEY: enterprise-production-secret-key-min-32-chars
+      SAFETY_BRAKE_THRESHOLD_PERCENT: 30.0
+      OUTBOX_POLL_INTERVAL_SECONDS: 1.0
+    ports:
+      - "8000:8000"
+    networks:
+      - moveinsync_net
+
+volumes:
+  postgres_data:
+
+networks:
+  moveinsync_net:
+    driver: bridge
