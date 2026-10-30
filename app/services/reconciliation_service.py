@@ -536,10 +536,10 @@ class ReconciliationService:
             existing = await self.recon_repo.get_by_run_id(tenant_id, run_id)
             if not existing:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Reconciliation run not found")
-            if existing.status == "APPROVING":
+            if existing.status in ("APPROVING", "COMPLETED"):
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
-                    detail="Run is already being approved by another operator",
+                    detail=f"Run is already {existing.status.lower()} by another operator",
                 )
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
