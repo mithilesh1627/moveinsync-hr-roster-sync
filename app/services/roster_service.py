@@ -252,6 +252,21 @@ class RosterService:
                     ROSTER_EVENTS_TOTAL.labels(tenant=tenant_id, status="duplicate_noop").inc()
                     continue
 
+                # Rule 3: Deterministic tie-breaking on equal timestamp (Lexicographical hash comparison)
+                if event.source_timestamp == emp.source_timestamp and candidate_hash < emp.record_hash:
+                    stale_count += 1
+                    results.append(
+                        RosterRecordResult(
+                            record_index=idx,
+                            employee_id=event.employee_id,
+                            status="stale_ignored",
+                            source_version=event.source_version,
+                            message=f"Equal version {event.source_version} and timestamp with lower canonical hash ignored as stale",
+                        )
+                    )
+                    ROSTER_EVENTS_TOTAL.labels(tenant=tenant_id, status="stale_ignored").inc()
+                    continue
+
             # =================================================================
             # VALID NEWER VERSION: APPLY FIELD OWNERSHIP INVARIANTS
             # =================================================================

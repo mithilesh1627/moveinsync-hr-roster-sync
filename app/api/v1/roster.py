@@ -40,8 +40,9 @@ async def ingest_roster_events(
     tenant_id = auth.tenant_id
     idempotency_service = IdempotencyService(session)
 
-    # 1. Check Idempotency Key if supplied
+    # 1. Acquire transaction advisory lock and check Idempotency Key if supplied
     if x_idempotency_key:
+        await idempotency_service.acquire_transaction_lock(tenant_id, x_idempotency_key)
         cached_result = await idempotency_service.check_idempotency(
             tenant_id=tenant_id,
             idempotency_key=x_idempotency_key,
@@ -59,10 +60,7 @@ async def ingest_roster_events(
         request=request,
     )
 
-    # 3. Commit state changes & outbox events atomically
-    await session.commit()
-
-    # 4. Save Idempotency execution record if key provided
+    # 3. Save Idempotency execution record within the SAME transaction
     if x_idempotency_key:
         await idempotency_service.record_execution(
             tenant_id=tenant_id,
@@ -71,6 +69,8 @@ async def ingest_roster_events(
             response_code=status.HTTP_200_OK,
             response_body=batch_response.model_dump(),
         )
-        await session.commit()
+
+    # 4. Commit all state changes, outbox events, and idempotency record ATOMICALLY
+    await session.commit()
 
     return batch_response

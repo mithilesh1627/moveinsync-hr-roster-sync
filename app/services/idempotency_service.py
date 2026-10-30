@@ -7,6 +7,7 @@ Replays return cached responses; payload mismatches return HTTP 409 Conflict.
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple, Any
 from fastapi import HTTPException, status
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -18,7 +19,19 @@ from app.utils.hashing import compute_payload_hash
 
 class IdempotencyService:
     def __init__(self, session: AsyncSession):
+        self.session = session
         self.repo = IdempotencyRepository(session)
+
+    async def acquire_transaction_lock(self, tenant_id: str, idempotency_key: str) -> None:
+        """Acquire a transaction-level advisory lock scoped to (tenant_id, idempotency_key).
+        
+        Serializes concurrent requests using the same idempotency key.
+        PostgreSQL automatically releases this lock on transaction commit or rollback.
+        """
+        await self.session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext(:t), hashtext(:k))"),
+            {"t": tenant_id, "k": idempotency_key},
+        )
 
     async def check_idempotency(
         self,

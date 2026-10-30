@@ -71,6 +71,7 @@ class ReconciliationService:
 
         seen_in_export: Set[str] = set()
         duplicate_ids_in_file: List[str] = []
+        malformed_rows_count = 0
 
         records_created = 0
         records_updated = 0
@@ -79,6 +80,9 @@ class ReconciliationService:
 
         # Stream lines via csv.DictReader
         reader = csv.DictReader(file_content)
+        fieldnames = [f.strip().lower() for f in (reader.fieldnames or []) if f]
+        header_valid = "employee_id" in fieldnames
+
         chunk: List[Dict[str, str]] = []
         chunk_size = settings.reconciliation_chunk_size
 
@@ -214,8 +218,13 @@ class ReconciliationService:
 
         # Process file stream in chunks
         for row in reader:
-            emp_id = row.get("employee_id", "").strip()
+            if not header_valid:
+                malformed_rows_count += 1
+                continue
+
+            emp_id = (row.get("employee_id") or "").strip()
             if not emp_id:
+                malformed_rows_count += 1
                 continue
 
             if emp_id in seen_in_export:
@@ -269,20 +278,25 @@ class ReconciliationService:
         run_record.missing_active_records = missing_count
         run_record.missing_percentage = round(missing_percentage, 2)
 
+        anomaly_dict = {
+            "threshold_percent": threshold,
+            "total_active_before": total_active_before,
+            "missing_count": missing_count,
+            "missing_percentage": round(missing_percentage, 2),
+            "sample_missing_ids": missing_employee_ids[:20],
+            "all_missing_ids": missing_employee_ids,
+            "duplicate_ids_in_file_count": len(duplicate_ids_in_file),
+            "duplicate_sample_ids": duplicate_ids_in_file[:10],
+            "malformed_rows_count": malformed_rows_count,
+            "header_valid": header_valid,
+            "elapsed_seconds": round(elapsed_seconds, 2),
+        }
+        run_record.anomaly_report = anomaly_dict
+
         if missing_percentage >= threshold:
             # SAFETY BRAKE TRIGGERED: Halt deactivations and require human approval
             run_record.status = "SAFETY_BRAKE_TRIGGERED"
             run_record.operator_review_required = True
-            run_record.anomaly_report = {
-                "threshold_percent": threshold,
-                "total_active_before": total_active_before,
-                "missing_count": missing_count,
-                "missing_percentage": round(missing_percentage, 2),
-                "sample_missing_ids": missing_employee_ids[:20],
-                "all_missing_ids": missing_employee_ids,
-                "duplicate_ids_in_file_count": len(duplicate_ids_in_file),
-                "elapsed_seconds": round(elapsed_seconds, 2),
-            }
             await self.session.commit()
 
             SAFETY_BRAKE_TRIGGERS_TOTAL.labels(tenant=tenant_id).inc()
@@ -292,6 +306,10 @@ class ReconciliationService:
                 extra={"tenant_id": tenant_id, "run_id": run_id},
             )
             return run_record
+
+        # Flag review if anomalous duplicates or malformed rows detected even if below deactivation threshold
+        if malformed_rows_count > 0 or len(duplicate_ids_in_file) > 0:
+            run_record.operator_review_required = True
 
         # NORMAL RUN: Missing percentage < threshold -> Apply deactivations
         records_deactivated = 0
