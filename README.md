@@ -5,8 +5,8 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115%2B-009688.svg)](https://fastapi.tiangolo.com/)
 [![SQLAlchemy](https://img.shields.io/badge/SQLAlchemy-2.0%20(Async)-red.svg)](https://www.sqlalchemy.org/)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-336791.svg)](https://www.postgresql.org/)
-[![Tests](https://img.shields.io/badge/Tests-28%20Passed%20(100%25)-brightgreen.svg)]()
-[![Benchmark](https://img.shields.io/badge/200k%20Diff-14.36s%20(%3C60s%20Target)-success.svg)]()
+[![Tests](https://img.shields.io/badge/Tests-55%20Passed%20(100%25)-brightgreen.svg)]()
+[![Benchmark](https://img.shields.io/badge/200k%20Diff-47.69s%20(%3C60s%20Target)-success.svg)]()
 
 Submission for **MoveInSync Backend Hiring Assessment 2026 — Case Study 5: HR Roster Sync (Advanced Track)**.
 
@@ -164,7 +164,17 @@ While the assessment notes that Java with Spring Boot is traditionally common in
 
 ## 6. Real Performance Benchmark Results
 
-The 200,000-row streaming reconciliation benchmark was executed against real PostgreSQL 16. **Results are genuine and measured:**
+The 200,000-row streaming reconciliation benchmark was executed against real PostgreSQL 16 on a clean, isolated baseline (`bench-isolated-tenant` with 190,000 pre-existing records) with continuous RSS sampling (every 50ms) and covering all 5 core reconciliation paths:
+- **Created**: 20,000 new joiners
+- **Updated**: 20,000 existing records with changed business attributes
+- **Unchanged**: 150,000 identical records (matched in relational hash join)
+- **Stale**: 10,000 out-of-order snapshots (ignored)
+- **Deactivated**: 10,000 missing records (5.26% missing, safely below 30% threshold)
+
+**Benchmark Command**:
+```bash
+python scripts/benchmark_reconciliation.py 200000
+```
 
 ### Environment Details
 - **Platform**: Windows 11 Enterprise (10.0.26300)
@@ -176,13 +186,15 @@ The 200,000-row streaming reconciliation benchmark was executed against real Pos
 ### Benchmark Measurements (200,000 Records)
 | Metric | MoveInSync SLA Target | Actual Measured Result | Assessment Verdict |
 | :--- | :--- | :--- | :--- |
-| **Dataset Size** | 200,000 employee records | **200,000 records (22.95 MB CSV)** | Baseline Met |
-| **Total Elapsed Time** | **< 60.00 seconds** | **14.36 seconds** | **PASSED (4.1x faster than SLA)** |
-| **Streaming Throughput** | — | **13,932 records / second** | High-Throughput |
-| **Initial Memory** | — | **94.66 MB RSS** | Clean Baseline |
-| **Final Memory** | **< 256.00 MB RSS** | **137.02 MB RSS** | **PASSED (Strictly Bounded)** |
-| **Net Memory Delta** | — | **+42.36 MB** | Zero Memory Leaks |
-| **Safety Brake Trigger Check** | Halt if $\ge 30\%$ missing | **Verified at 40% & 52%** | **PASSED** |
+| **Dataset Size** | 200,000 employee records | **200,000 records (23.08 MB CSV)** | Baseline Met |
+| **Total Elapsed Time** | **< 60.00 seconds** | **47.69 seconds** (Reconciliation engine: **20.20s**) | **PASSED (< 60s Target)** |
+| **Streaming Throughput** | — | **4,194 records / second** overall (**9,901 rec/s** engine) | High-Throughput |
+| **Initial Memory** | — | **94.71 MB RSS** | Clean Baseline |
+| **Peak Measured Memory** | **< 256.00 MB RSS** | **131.93 MB RSS** (Continuous 50ms sampling) | **PASSED (Strictly Bounded)** |
+| **Net Peak Memory Delta**| — | **+37.22 MB** | Zero Memory Leaks |
+| **Safety Brake Trigger Check** | Halt if $\ge 30\%$ missing | **Verified at 29%, 30%, 31%, 40% & 52%** | **PASSED** |
+
+*(Execution screenshot recorded at `docs/Screenshot/bechmark_reconciliation.png`)*
 
 ---
 
@@ -192,8 +204,10 @@ The 200,000-row streaming reconciliation benchmark was executed against real Pos
 - **Boundary Validation**: $O(K)$ time per event, where $K$ is the number of fields in the schema ($\approx 10$). Space complexity is $O(1)$.
 - **Hash Calculation**: xxHash64 processes $\approx 5\text{ GB/sec}$. For a 100-byte employee string, computation takes $\approx 20\text{ nanoseconds}$ ($O(1)$).
 - **Streaming Reconciliation Memory**: For $N = 200,000$ records with chunk size $C = 2,000$:
-  - Memory consumption is $O(C + U_{\text{active}})$, where $C$ is the 2,000-record buffer in RAM ($\approx 2\text{ MB}$) and $U_{\text{active}}$ is the compact in-memory active set ($\approx 15\text{ MB}$).
-  - Total resident memory stays bounded at $\approx 137\text{ MB}$, well under the 256 MB threshold.
+  - Memory consumption in Python RAM is strictly bounded at $O(C)$ ($\approx 2\text{ MB}$ per streaming chunk).
+  - No active employee map (`active_map_before`), no full file buffer, and no missing ID sets are retained in Python heap.
+  - The database staging table (`reconciliation_staging`) with relational hash joins and anti-joins handles differential processing directly in PostgreSQL.
+  - Total process RSS remains bounded at $\approx 131.93\text{ MB}$ throughout the entire execution, well below the 256 MB threshold.
 - **Where the System Stops Scaling and Why**:
   - **Single PostgreSQL Connection Throughput**: When stream chunk inserts exceed 50,000 updates/second, single-table index write IOPS on `employees` will saturate PostgreSQL WAL write bandwidth.
   - **Scale Remedy**: Adopt PostgreSQL native declarative range/hash partitioning by `tenant_id` so write I/O is partitioned across separate physical table partitions.

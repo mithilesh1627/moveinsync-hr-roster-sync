@@ -3,8 +3,8 @@
 Uses Pydantic Settings v2 to load, validate, and manage environment configuration.
 """
 
-from typing import Literal
-from pydantic import Field
+from typing import Literal, List
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -24,6 +24,14 @@ class Settings(BaseSettings):
     # Server
     host: str = "0.0.0.0"
     port: int = 8000
+
+    # CORS
+    cors_allowed_origins: List[str] = [
+        "http://localhost:3000",
+        "http://localhost:8000",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:8000",
+    ]
 
     # PostgreSQL Database
     database_url: str = Field(
@@ -64,6 +72,31 @@ class Settings(BaseSettings):
     # Caching
     cache_ttl_seconds: int = 300
     cache_max_entries: int = 1000
+
+    @model_validator(mode="after")
+    def validate_production_security(self) -> "Settings":
+        """Enforce strict production security policies at startup."""
+        if self.app_env == "production":
+            insecure_defaults = {
+                "dev-secret-key-change-in-production-min-32-chars-long",
+                "enterprise-production-secret-key-min-32-chars",
+                "secret",
+                "change-me",
+                "password",
+            }
+            if not self.jwt_secret_key or len(self.jwt_secret_key) < 32:
+                raise ValueError(
+                    "Production startup failed: JWT_SECRET_KEY must be at least 32 characters long."
+                )
+            if self.jwt_secret_key in insecure_defaults:
+                raise ValueError(
+                    "Production startup failed: Insecure default JWT_SECRET_KEY detected. Provide a secure, unique secret."
+                )
+            if "*" in self.cors_allowed_origins:
+                raise ValueError(
+                    "Production startup failed: Wildcard CORS origin '*' is not permitted in production."
+                )
+        return self
 
 
 settings = Settings()

@@ -1,6 +1,7 @@
 """API v1 Router Aggregator"""
 
 from fastapi import APIRouter
+from app.core.config import settings
 from app.api.v1.auth import router as auth_router
 from app.api.v1.roster import router as roster_router
 from app.api.v1.transport import router as transport_router
@@ -19,4 +20,7 @@ api_v1_router.include_router(transport_router)
 api_v1_router.include_router(employees_router)
 api_v1_router.include_router(recon_router)
 api_v1_router.include_router(outbox_router)
-api_v1_router.include_router(mock_downstream_router)
+
+# Only expose mock downstream simulator outside production
+if settings.app_env != "production":
+    api_v1_router.include_router(mock_downstream_router)

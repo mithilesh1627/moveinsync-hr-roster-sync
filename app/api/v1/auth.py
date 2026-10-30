@@ -1,7 +1,8 @@
 """Authentication Router"""
 
 from fastapi import APIRouter, HTTPException, status
-from app.core.auth import create_access_token
+from app.core.config import settings
+from app.core.auth import create_access_token, authenticate_client
 from app.schemas.auth import LoginRequest, TokenResponse
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
@@ -9,19 +10,18 @@ router = APIRouter(prefix="/auth", tags=["Authentication"])
 
 @router.post("/token", response_model=TokenResponse)
 async def login_for_access_token(request: LoginRequest):
-    """Authenticate client and generate a signed JWT with role entitlements."""
-    # Deterministic development credentials
-    # In production, credentials validate against hashed secrets in vault/DB
-    client_id = request.client_id.lower()
-    
-    if "admin" in client_id:
-        roles = ["transport_admin"]
-    elif "operator" in client_id:
-        roles = ["operator", "transport_admin", "hr_integration"]
-    elif "hr" in client_id:
-        roles = ["hr_integration"]
-    else:
-        roles = ["employee"]
+    """Authenticate client credentials and generate a signed JWT with verified role entitlements."""
+    roles = authenticate_client(
+        tenant_id=request.tenant_id,
+        client_id=request.client_id,
+        client_secret=request.client_secret,
+    )
+    if not roles:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid client credentials or tenant not registered",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
     token = create_access_token(
         user_id=request.client_id,
@@ -32,7 +32,7 @@ async def login_for_access_token(request: LoginRequest):
     return TokenResponse(
         access_token=token,
         token_type="bearer",
-        expires_in_minutes=1440,
+        expires_in_minutes=settings.access_token_expire_minutes,
         tenant_id=request.tenant_id,
         roles=roles,
     )

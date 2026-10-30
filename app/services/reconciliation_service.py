@@ -1,17 +1,17 @@
 """Streaming Reconciliation Engine & Configurable Safety Brake
 
 Processes nightly roster export files (up to 200,000 rows) in bounded streaming chunks.
-Compares canonical hashes against stored records without loading the entire dataset into memory.
+Uses database staging tables and SQL anti-joins to strictly bound memory (< 256MB).
 Enforces the 30% safety brake to protect against mass wrongful deactivations from truncated exports.
+Provides concurrency-safe operator approval via the APPROVING state.
 """
 
 import csv
 import io
-import json
 import time
 import uuid
-from typing import AsyncIterator, Dict, List, Set, Tuple, Optional, Any
-from sqlalchemy import select, update, func
+from typing import Dict, List, Tuple, Optional, Any
+from sqlalchemy import select, update, func, exists, distinct
 from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi import HTTPException, status
 
@@ -24,7 +24,7 @@ from app.core.metrics import (
 from app.models.base import utc_now
 from app.models.employee import Employee
 from app.models.outbox import OutboxEvent
-from app.models.reconciliation import ReconciliationRun
+from app.models.reconciliation import ReconciliationRun, ReconciliationStaging
 from app.repositories.employee_repo import EmployeeRepository
 from app.repositories.outbox_repo import OutboxRepository
 from app.repositories.reconciliation_repo import ReconciliationRepository
@@ -46,10 +46,10 @@ class ReconciliationService:
         self,
         tenant_id: str,
         filename: str,
-        file_content: io.TextIOBase,
+        file_content: Any,
         threshold_percent: Optional[float] = None,
     ) -> ReconciliationRun:
-        """Stream and diff full nightly export file with bounded memory and safety brake."""
+        """Stream and diff full nightly export file using database staging tables with bounded memory and safety brake."""
         start_time = time.monotonic()
         threshold = threshold_percent if threshold_percent is not None else settings.safety_brake_threshold_percent
         run_id = f"recon-{tenant_id}-{uuid.uuid4().hex[:8]}"
@@ -65,67 +65,87 @@ class ReconciliationService:
         await self.recon_repo.create_run(recon_run)
         await self.session.commit()
 
-        # Fetch active employee map prior to run: {employee_id: record_hash}
-        active_map_before: Dict[str, str] = await self.employee_repo.get_active_ids_and_hashes(tenant_id)
-        total_active_before = len(active_map_before)
+        # 1. Total active employees before run (SQL COUNT, zero Python memory!)
+        total_active_before = await self.employee_repo.count_active(tenant_id)
 
-        seen_in_export: Set[str] = set()
-        duplicate_ids_in_file: List[str] = []
-        malformed_rows_count = 0
-
-        records_created = 0
-        records_updated = 0
-        records_unchanged = 0
-        records_stale = 0
-
-        # Stream lines via csv.DictReader
+        # 2. Stream input CSV in bounded chunks directly into reconciliation_staging
         reader = csv.DictReader(file_content)
         fieldnames = [f.strip().lower() for f in (reader.fieldnames or []) if f]
         header_valid = "employee_id" in fieldnames
 
-        chunk: List[Dict[str, str]] = []
+        staging_buffer: List[ReconciliationStaging] = []
+        chunk_seen_ids: Dict[str, int] = {}  # Scoped strictly to current chunk for duplicate collision prevention
         chunk_size = settings.reconciliation_chunk_size
 
-        async def process_chunk(batch: List[Dict[str, str]]) -> Tuple[int, int, int, int]:
-            c_created = 0
-            c_updated = 0
-            c_unchanged = 0
-            c_stale = 0
+        malformed_rows_count = 0
+        duplicate_ids_count = 0
+        duplicate_sample_ids: List[str] = []
 
-            emp_ids = [row.get("employee_id", "").strip() for row in batch if row.get("employee_id")]
-            if not emp_ids:
-                return 0, 0, 0, 0
+        for row in reader:
+            if not header_valid:
+                malformed_rows_count += 1
+                continue
 
-            # Query existing employees in this batch
-            query = select(Employee).where(
-                Employee.tenant_id == tenant_id,
-                Employee.employee_id.in_(emp_ids),
-            )
-            result = await self.session.execute(query)
-            existing_by_id = {emp.employee_id: emp for emp in result.scalars().all()}
+            emp_id = (row.get("employee_id") or "").strip()
+            first_name = (row.get("first_name") or "").strip()
+            last_name = (row.get("last_name") or "").strip()
+            email = (row.get("email") or "").strip().lower()
+            office_code = (row.get("office_code") or "").strip().upper()
 
-            new_employees: List[Employee] = []
-            outbox_events: List[OutboxEvent] = []
+            # Required fields validation
+            if not (emp_id and first_name and last_name and email and office_code):
+                malformed_rows_count += 1
+                continue
 
-            for row in batch:
-                emp_id = row.get("employee_id", "").strip()
-                if not emp_id:
+            # Email format validation
+            if "@" not in email:
+                malformed_rows_count += 1
+                continue
+
+            # Status validation
+            status_val = (row.get("status") or "ACTIVE").strip().upper()
+            if status_val not in ("ACTIVE", "INACTIVE"):
+                malformed_rows_count += 1
+                continue
+
+            # Source version validation (must be positive integer, not defaulted)
+            raw_version = (row.get("source_version") or "").strip()
+            try:
+                version = int(raw_version)
+                if version < 1:
+                    malformed_rows_count += 1
                     continue
+            except (ValueError, TypeError):
+                malformed_rows_count += 1
+                continue
 
-                first_name = row.get("first_name", "").strip()
-                last_name = row.get("last_name", "").strip()
-                email = row.get("email", "").strip().lower()
-                phone = row.get("phone", "").strip() or None
-                office_code = row.get("office_code", "").strip().upper()
-                department = row.get("department", "").strip() or None
-                manager_id = row.get("manager_id", "").strip() or None
-                status_val = row.get("status", "ACTIVE").strip().upper()
-                try:
-                    version = int(row.get("source_version", "1"))
-                except ValueError:
-                    version = 1
+            phone = (row.get("phone") or "").strip() or None
+            department = (row.get("department") or "").strip() or None
+            manager_id = (row.get("manager_id") or "").strip() or None
 
-                candidate_hash = compute_canonical_record_hash(
+            candidate_hash = compute_canonical_record_hash(
+                employee_id=emp_id,
+                first_name=first_name,
+                last_name=last_name,
+                email=email,
+                phone=phone,
+                office_code=office_code,
+                department=department,
+                manager_id=manager_id,
+                status=status_val,
+            )
+
+            # Duplicate employee ID check within chunk
+            if emp_id in chunk_seen_ids:
+                duplicate_ids_count += 1
+                if len(duplicate_sample_ids) < 10:
+                    duplicate_sample_ids.append(emp_id)
+                # Overwrite earlier row in staging buffer with latest
+                idx = chunk_seen_ids[emp_id]
+                staging_buffer[idx] = ReconciliationStaging(
+                    id=uuid.uuid4(),
+                    run_id=run_id,
+                    tenant_id=tenant_id,
                     employee_id=emp_id,
                     first_name=first_name,
                     last_name=last_name,
@@ -135,146 +155,92 @@ class ReconciliationService:
                     department=department,
                     manager_id=manager_id,
                     status=status_val,
+                    source_version=version,
+                    record_hash=candidate_hash,
                 )
+                continue
 
-                if emp_id not in existing_by_id:
-                    # CREATE
-                    new_emp = Employee(
-                        tenant_id=tenant_id,
-                        employee_id=emp_id,
-                        first_name=first_name,
-                        last_name=last_name,
-                        email=email,
-                        phone=phone,
-                        office_code=office_code,
-                        department=department,
-                        manager_id=manager_id,
-                        status=status_val,
-                        source_version=version,
-                        record_hash=candidate_hash,
-                        transport_review_required=False,
-                    )
-                    new_employees.append(new_emp)
-                    outbox_events.append(
-                        OutboxEvent(
-                            id=uuid.uuid4(),
-                            tenant_id=tenant_id,
-                            event_type="EMPLOYEE_CREATED",
-                            aggregate_id=emp_id,
-                            payload={"employee_id": emp_id, "status": status_val, "source": "reconciliation"},
-                            status="PENDING",
-                            retry_count=0,
-                            next_retry_at=utc_now(),
-                        )
-                    )
-                    c_created += 1
-                else:
-                    emp = existing_by_id[emp_id]
-                    if candidate_hash == emp.record_hash and emp.status == status_val:
-                        # UNCHANGED: Stable hash match (Zero DB writes!)
-                        c_unchanged += 1
-                    elif version < emp.source_version:
-                        # STALE: Lower version than current stored record
-                        c_stale += 1
-                    else:
-                        # UPDATE: HR fields modified (Preserve Transport fields!)
-                        office_changed = (emp.office_code != office_code)
-                        emp.first_name = first_name
-                        emp.last_name = last_name
-                        emp.email = email
-                        emp.phone = phone
-                        emp.office_code = office_code
-                        emp.department = department
-                        emp.manager_id = manager_id
-                        emp.status = status_val
-                        emp.source_version = version
-                        emp.record_hash = candidate_hash
+            chunk_seen_ids[emp_id] = len(staging_buffer)
+            staging_buffer.append(
+                ReconciliationStaging(
+                    id=uuid.uuid4(),
+                    run_id=run_id,
+                    tenant_id=tenant_id,
+                    employee_id=emp_id,
+                    first_name=first_name,
+                    last_name=last_name,
+                    email=email,
+                    phone=phone,
+                    office_code=office_code,
+                    department=department,
+                    manager_id=manager_id,
+                    status=status_val,
+                    source_version=version,
+                    record_hash=candidate_hash,
+                )
+            )
 
-                        if office_changed and (emp.preferred_pickup_point_id or emp.pickup_geofence):
-                            emp.transport_review_required = True
+            if len(staging_buffer) >= chunk_size:
+                self.session.add_all(staging_buffer)
+                await self.session.commit()
+                staging_buffer.clear()
+                chunk_seen_ids.clear()
 
-                        event_type = "OFFICE_TRANSFERRED" if office_changed else "EMPLOYEE_UPDATED"
-                        outbox_events.append(
-                            OutboxEvent(
-                                id=uuid.uuid4(),
-                                tenant_id=tenant_id,
-                                event_type=event_type,
-                                aggregate_id=emp_id,
-                                payload={"employee_id": emp_id, "status": status_val, "source": "reconciliation"},
-                                status="PENDING",
-                                retry_count=0,
-                                next_retry_at=utc_now(),
-                            )
-                        )
-                        c_updated += 1
-
-            if new_employees:
-                self.session.add_all(new_employees)
-            if outbox_events:
-                self.session.add_all(outbox_events)
-
+        # Flush remaining tail staging buffer
+        if staging_buffer:
+            self.session.add_all(staging_buffer)
             await self.session.commit()
-            return c_created, c_updated, c_unchanged, c_stale
+            staging_buffer.clear()
+            chunk_seen_ids.clear()
 
-        # Process file stream in chunks
-        for row in reader:
-            if not header_valid:
-                malformed_rows_count += 1
-                continue
+        # 3. Database-Driven Anti-Joins and Diff Counts
+        stmt_count = select(func.count(distinct(ReconciliationStaging.employee_id))).where(
+            ReconciliationStaging.run_id == run_id,
+            ReconciliationStaging.tenant_id == tenant_id,
+        )
+        total_records_received = (await self.session.execute(stmt_count)).scalar() or 0
 
-            emp_id = (row.get("employee_id") or "").strip()
-            if not emp_id:
-                malformed_rows_count += 1
-                continue
-
-            if emp_id in seen_in_export:
-                duplicate_ids_in_file.append(emp_id)
-            seen_in_export.add(emp_id)
-
-            chunk.append(row)
-            if len(chunk) >= chunk_size:
-                c_cr, c_up, c_un, c_st = await process_chunk(chunk)
-                records_created += c_cr
-                records_updated += c_up
-                records_unchanged += c_un
-                records_stale += c_st
-                chunk.clear()
-
-        # Process remaining tail chunk
-        if chunk:
-            c_cr, c_up, c_un, c_st = await process_chunk(chunk)
-            records_created += c_cr
-            records_updated += c_up
-            records_unchanged += c_un
-            records_stale += c_st
-            chunk.clear()
-
-        # =====================================================================
-        # SAFETY BRAKE & DEACTIVATION ANALYSIS
-        # =====================================================================
-        # Identify active employees missing from export
-        missing_employee_ids = [
-            emp_id for emp_id in active_map_before.keys()
-            if emp_id not in seen_in_export
-        ]
-        missing_count = len(missing_employee_ids)
+        # Anti-join to identify missing active employees
+        stmt_missing = select(func.count()).select_from(Employee).where(
+            Employee.tenant_id == tenant_id,
+            Employee.status == "ACTIVE",
+            ~exists().where(
+                ReconciliationStaging.run_id == run_id,
+                ReconciliationStaging.tenant_id == tenant_id,
+                ReconciliationStaging.employee_id == Employee.employee_id,
+            ),
+        )
+        missing_count = (await self.session.execute(stmt_missing)).scalar() or 0
         missing_percentage = (
             (missing_count / total_active_before) * 100.0 if total_active_before > 0 else 0.0
         )
 
-        total_records_received = len(seen_in_export)
+        # Sample missing IDs for operator inspection (limit 20)
+        sample_missing_ids: List[str] = []
+        if missing_count > 0:
+            stmt_sample = (
+                select(Employee.employee_id)
+                .where(
+                    Employee.tenant_id == tenant_id,
+                    Employee.status == "ACTIVE",
+                    Employee.employee_id.not_in(
+                        select(ReconciliationStaging.employee_id).where(
+                            ReconciliationStaging.run_id == run_id,
+                            ReconciliationStaging.tenant_id == tenant_id,
+                        )
+                    ),
+                )
+                .limit(20)
+            )
+            sample_missing_ids = list((await self.session.execute(stmt_sample)).scalars().all())
+
         elapsed_seconds = time.monotonic() - start_time
 
-        # Update run stats
         run_record = await self.recon_repo.get_by_run_id(tenant_id, run_id, for_update=True)
         if not run_record:
             raise RuntimeError(f"Reconciliation run {run_id} lost")
 
         run_record.total_records_received = total_records_received
-        run_record.records_created = records_created
-        run_record.records_updated = records_updated
-        run_record.records_unchanged = records_unchanged
-        run_record.records_stale = records_stale
         run_record.missing_active_records = missing_count
         run_record.missing_percentage = round(missing_percentage, 2)
 
@@ -283,18 +249,17 @@ class ReconciliationService:
             "total_active_before": total_active_before,
             "missing_count": missing_count,
             "missing_percentage": round(missing_percentage, 2),
-            "sample_missing_ids": missing_employee_ids[:20],
-            "all_missing_ids": missing_employee_ids,
-            "duplicate_ids_in_file_count": len(duplicate_ids_in_file),
-            "duplicate_sample_ids": duplicate_ids_in_file[:10],
+            "sample_missing_ids": sample_missing_ids,
+            "duplicate_ids_in_file_count": duplicate_ids_count,
+            "duplicate_sample_ids": duplicate_sample_ids[:10],
             "malformed_rows_count": malformed_rows_count,
             "header_valid": header_valid,
             "elapsed_seconds": round(elapsed_seconds, 2),
         }
         run_record.anomaly_report = anomaly_dict
 
+        # 4. SAFETY BRAKE CHECK
         if missing_percentage >= threshold:
-            # SAFETY BRAKE TRIGGERED: Halt deactivations and require human approval
             run_record.status = "SAFETY_BRAKE_TRIGGERED"
             run_record.operator_review_required = True
             await self.session.commit()
@@ -308,17 +273,177 @@ class ReconciliationService:
             return run_record
 
         # Flag review if anomalous duplicates or malformed rows detected even if below deactivation threshold
-        if malformed_rows_count > 0 or len(duplicate_ids_in_file) > 0:
+        if malformed_rows_count > 0 or duplicate_ids_count > 0:
             run_record.operator_review_required = True
 
-        # NORMAL RUN: Missing percentage < threshold -> Apply deactivations
+        # 5. BELOW THRESHOLD: APPLY CREATES, UPDATES, UNCHANGED & DEACTIVATIONS
+        # A. Count unchanged records via high-speed relational hash join in PostgreSQL (0.1s)
+        stmt_unchanged = (
+            select(func.count())
+            .select_from(ReconciliationStaging)
+            .join(
+                Employee,
+                (Employee.tenant_id == ReconciliationStaging.tenant_id)
+                & (Employee.employee_id == ReconciliationStaging.employee_id),
+            )
+            .where(
+                ReconciliationStaging.run_id == run_id,
+                ReconciliationStaging.tenant_id == tenant_id,
+                ReconciliationStaging.record_hash == Employee.record_hash,
+                ReconciliationStaging.status == Employee.status,
+                ReconciliationStaging.source_version == Employee.source_version,
+            )
+        )
+        records_unchanged = (await self.session.execute(stmt_unchanged)).scalar() or 0
+
+        # B. Process only real deltas (creates, field updates, version advances, and stale drops)
+        records_created = 0
+        records_updated = 0
+        records_stale = 0
+
+        last_staging_id = None
+        while True:
+            query_delta = (
+                select(ReconciliationStaging)
+                .outerjoin(
+                    Employee,
+                    (Employee.tenant_id == ReconciliationStaging.tenant_id)
+                    & (Employee.employee_id == ReconciliationStaging.employee_id),
+                )
+                .where(
+                    ReconciliationStaging.run_id == run_id,
+                    ReconciliationStaging.tenant_id == tenant_id,
+                    (
+                        (Employee.id.is_(None))
+                        | (ReconciliationStaging.record_hash != Employee.record_hash)
+                        | (ReconciliationStaging.status != Employee.status)
+                        | (ReconciliationStaging.source_version != Employee.source_version)
+                    ),
+                )
+            )
+            if last_staging_id is not None:
+                query_delta = query_delta.where(ReconciliationStaging.id > last_staging_id)
+            query_delta = query_delta.order_by(ReconciliationStaging.id).limit(chunk_size)
+
+            staging_chunk = list((await self.session.execute(query_delta)).scalars().all())
+            if not staging_chunk:
+                break
+            last_staging_id = staging_chunk[-1].id
+
+            chunk_emp_ids = [s.employee_id for s in staging_chunk]
+            stmt_emp = select(Employee).where(
+                Employee.tenant_id == tenant_id,
+                Employee.employee_id.in_(chunk_emp_ids),
+            )
+            res_emp = await self.session.execute(stmt_emp)
+            existing_by_id = {e.employee_id: e for e in res_emp.scalars().all()}
+
+            new_employees: List[Employee] = []
+            outbox_events: List[OutboxEvent] = []
+
+            for s in staging_chunk:
+                if s.employee_id not in existing_by_id:
+                    # CREATE
+                    new_emp = Employee(
+                        tenant_id=tenant_id,
+                        employee_id=s.employee_id,
+                        first_name=s.first_name,
+                        last_name=s.last_name,
+                        email=s.email,
+                        phone=s.phone,
+                        office_code=s.office_code,
+                        department=s.department,
+                        manager_id=s.manager_id,
+                        status=s.status,
+                        source_version=s.source_version,
+                        record_hash=s.record_hash,
+                        transport_review_required=False,
+                    )
+                    new_employees.append(new_emp)
+                    existing_by_id[s.employee_id] = new_emp  # Prevent duplicate within same chunk
+                    outbox_events.append(
+                        OutboxEvent(
+                            id=uuid.uuid4(),
+                            tenant_id=tenant_id,
+                            event_type="EMPLOYEE_CREATED",
+                            aggregate_id=s.employee_id,
+                            payload={"employee_id": s.employee_id, "status": s.status, "source": "reconciliation"},
+                            status="PENDING",
+                            retry_count=0,
+                            next_retry_at=utc_now(),
+                        )
+                    )
+                    records_created += 1
+                else:
+                    emp = existing_by_id[s.employee_id]
+                    if s.source_version < emp.source_version:
+                        records_stale += 1
+                    elif s.record_hash == emp.record_hash and emp.status == s.status:
+                        if s.source_version > emp.source_version:
+                            # Advance source_version for newer snapshots even when business fields are unchanged!
+                            emp.source_version = s.source_version
+                            emp.updated_at = utc_now()
+                            records_updated += 1
+                    else:
+                        # HR fields modified or status changed
+                        office_changed = (emp.office_code != s.office_code)
+                        emp.first_name = s.first_name
+                        emp.last_name = s.last_name
+                        emp.email = s.email
+                        emp.phone = s.phone
+                        emp.office_code = s.office_code
+                        emp.department = s.department
+                        emp.manager_id = s.manager_id
+                        emp.status = s.status
+                        emp.source_version = s.source_version
+                        emp.record_hash = s.record_hash
+
+                        if office_changed and (emp.preferred_pickup_point_id or emp.pickup_geofence):
+                            emp.transport_review_required = True
+
+                        event_type = "OFFICE_TRANSFERRED" if office_changed else "EMPLOYEE_UPDATED"
+                        outbox_events.append(
+                            OutboxEvent(
+                                id=uuid.uuid4(),
+                                tenant_id=tenant_id,
+                                event_type=event_type,
+                                aggregate_id=s.employee_id,
+                                payload={"employee_id": s.employee_id, "status": s.status, "source": "reconciliation"},
+                                status="PENDING",
+                                retry_count=0,
+                                next_retry_at=utc_now(),
+                            )
+                        )
+                        records_updated += 1
+
+            if new_employees:
+                self.session.add_all(new_employees)
+            if outbox_events:
+                self.session.add_all(outbox_events)
+            await self.session.commit()
+
+        # Apply deactivations using database anti-join
         records_deactivated = 0
-        if missing_employee_ids:
-            # Deactivate in chunks of 1000
-            for i in range(0, len(missing_employee_ids), 1000):
-                batch_deact = missing_employee_ids[i:i + 1000]
-                await self.employee_repo.deactivate_batch(tenant_id, batch_deact)
-                # Enqueue Outbox deactivation events
+        if missing_count > 0:
+            stmt_deact = (
+                update(Employee)
+                .where(
+                    Employee.tenant_id == tenant_id,
+                    Employee.status == "ACTIVE",
+                    ~exists().where(
+                        ReconciliationStaging.run_id == run_id,
+                        ReconciliationStaging.tenant_id == tenant_id,
+                        ReconciliationStaging.employee_id == Employee.employee_id,
+                    ),
+                )
+                .values(status="INACTIVE", updated_at=utc_now())
+                .returning(Employee.employee_id)
+            )
+            res_deact = await self.session.execute(stmt_deact)
+            deactivated_ids = list(res_deact.scalars().all())
+
+            for i in range(0, len(deactivated_ids), 1000):
+                batch_deact = deactivated_ids[i:i + 1000]
                 deact_events = [
                     OutboxEvent(
                         id=uuid.uuid4(),
@@ -334,8 +459,12 @@ class ReconciliationService:
                 ]
                 self.session.add_all(deact_events)
                 await self.session.commit()
-            records_deactivated = len(missing_employee_ids)
+            records_deactivated = len(deactivated_ids)
 
+        run_record.records_created = records_created
+        run_record.records_updated = records_updated
+        run_record.records_unchanged = records_unchanged
+        run_record.records_stale = records_stale
         run_record.records_deactivated = records_deactivated
         run_record.status = "COMPLETED"
         run_record.completed_at = utc_now()
@@ -355,7 +484,7 @@ class ReconciliationService:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Reconciliation run not found")
 
         report = run.anomaly_report or {}
-        is_triggered = (run.status == "SAFETY_BRAKE_TRIGGERED")
+        is_triggered = (run.status in ("SAFETY_BRAKE_TRIGGERED", "APPROVING"))
 
         return ReconciliationReport(
             run_id=run.run_id,
@@ -383,24 +512,62 @@ class ReconciliationService:
         operator_id: str,
         reason: str,
     ) -> ReconciliationRun:
-        """Operator explicitly overrides safety brake and applies mass deactivations."""
-        run = await self.recon_repo.get_by_run_id(tenant_id, run_id, for_update=True)
-        if not run:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Reconciliation run not found")
+        """Operator explicitly overrides safety brake and applies mass deactivations with concurrency safety."""
+        # Atomic transition to APPROVING prevents concurrent approvals
+        stmt = (
+            update(ReconciliationRun)
+            .where(
+                ReconciliationRun.run_id == run_id,
+                ReconciliationRun.tenant_id == tenant_id,
+                ReconciliationRun.status == "SAFETY_BRAKE_TRIGGERED",
+            )
+            .values(
+                status="APPROVING",
+                operator_id=operator_id,
+                operator_action_notes=reason,
+            )
+            .returning(ReconciliationRun)
+        )
+        res = await self.session.execute(stmt)
+        run = res.scalar_one_or_none()
+        await self.session.commit()
 
-        if run.status != "SAFETY_BRAKE_TRIGGERED":
+        if not run:
+            existing = await self.recon_repo.get_by_run_id(tenant_id, run_id)
+            if not existing:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Reconciliation run not found")
+            if existing.status == "APPROVING":
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Run is already being approved by another operator",
+                )
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Run cannot be approved; current status is '{run.status}'",
+                detail=f"Run cannot be approved; current status is '{existing.status}'",
             )
 
-        report = run.anomaly_report or {}
-        all_missing: List[str] = report.get("all_missing_ids", [])
+        # Deactivate ONLY employees that are currently ACTIVE (anti-join against staging)
+        stmt_deact = (
+            update(Employee)
+            .where(
+                Employee.tenant_id == tenant_id,
+                Employee.status == "ACTIVE",
+                ~exists().where(
+                    ReconciliationStaging.run_id == run_id,
+                    ReconciliationStaging.tenant_id == tenant_id,
+                    ReconciliationStaging.employee_id == Employee.employee_id,
+                ),
+            )
+            .values(status="INACTIVE", updated_at=utc_now())
+            .returning(Employee.employee_id)
+        )
+        res_deact = await self.session.execute(stmt_deact)
+        deactivated_ids = list(res_deact.scalars().all())
 
-        if all_missing:
-            for i in range(0, len(all_missing), 1000):
-                batch_deact = all_missing[i:i + 1000]
-                await self.employee_repo.deactivate_batch(tenant_id, batch_deact)
+        # Only emit outbox events for employees that actually transitioned from ACTIVE to INACTIVE
+        if deactivated_ids:
+            for i in range(0, len(deactivated_ids), 1000):
+                batch_deact = deactivated_ids[i:i + 1000]
                 deact_events = [
                     OutboxEvent(
                         id=uuid.uuid4(),
@@ -417,18 +584,15 @@ class ReconciliationService:
                 self.session.add_all(deact_events)
                 await self.session.commit()
 
-        run.status = "COMPLETED"
-        run.approved_by_operator = True
-        run.operator_id = operator_id
-        run.operator_action_notes = reason
-        run.records_deactivated = len(all_missing)
-        run.completed_at = utc_now()
-        await self.session.commit()
+        run_record = await self.recon_repo.get_by_run_id(tenant_id, run_id, for_update=True)
+        if run_record:
+            run_record.status = "COMPLETED"
+            run_record.approved_by_operator = True
+            run_record.records_deactivated = len(deactivated_ids)
+            run_record.completed_at = utc_now()
+            await self.session.commit()
+            return run_record
 
-        logger.info(
-            f"Safety brake overridden by operator {operator_id} for run {run_id}. Deactivated {len(all_missing)} employees.",
-            extra={"tenant_id": tenant_id, "run_id": run_id},
-        )
         return run
 
     async def abort_run(
@@ -439,21 +603,33 @@ class ReconciliationService:
         reason: str,
     ) -> ReconciliationRun:
         """Operator aborts a halted reconciliation run, preventing any deactivations."""
-        run = await self.recon_repo.get_by_run_id(tenant_id, run_id, for_update=True)
-        if not run:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Reconciliation run not found")
+        stmt = (
+            update(ReconciliationRun)
+            .where(
+                ReconciliationRun.run_id == run_id,
+                ReconciliationRun.tenant_id == tenant_id,
+                ReconciliationRun.status == "SAFETY_BRAKE_TRIGGERED",
+            )
+            .values(
+                status="ABORTED",
+                operator_id=operator_id,
+                operator_action_notes=f"Aborted: {reason}",
+                completed_at=utc_now(),
+            )
+            .returning(ReconciliationRun)
+        )
+        res = await self.session.execute(stmt)
+        run = res.scalar_one_or_none()
+        await self.session.commit()
 
-        if run.status != "SAFETY_BRAKE_TRIGGERED":
+        if not run:
+            existing = await self.recon_repo.get_by_run_id(tenant_id, run_id)
+            if not existing:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Reconciliation run not found")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Run cannot be aborted; current status is '{run.status}'",
+                detail=f"Run cannot be aborted; current status is '{existing.status}'",
             )
-
-        run.status = "ABORTED"
-        run.operator_id = operator_id
-        run.operator_action_notes = f"Aborted: {reason}"
-        run.completed_at = utc_now()
-        await self.session.commit()
 
         logger.info(
             f"Reconciliation run {run_id} aborted by operator {operator_id}: {reason}",

@@ -73,3 +73,44 @@ class ReconciliationRun(Base):
     __table_args__ = (
         Index("idx_recon_tenant_status", "tenant_id", "status"),
     )
+
+
+class ReconciliationStaging(Base):
+    __tablename__ = "reconciliation_staging"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    run_id: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        index=True,
+    )
+    tenant_id: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        index=True,
+    )
+    employee_id: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        index=True,
+    )
+    first_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    last_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    email: Mapped[str] = mapped_column(String(255), nullable=False)
+    phone: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    office_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    department: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    manager_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    record_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+    __table_args__ = (
+        Index("idx_staging_run_tenant_emp", "run_id", "tenant_id", "employee_id"),
+        Index("idx_staging_emp_tenant_run", "tenant_id", "employee_id", "run_id"),
+    )

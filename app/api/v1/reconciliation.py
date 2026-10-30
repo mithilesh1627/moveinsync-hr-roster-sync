@@ -32,9 +32,8 @@ async def upload_reconciliation_file(
     tenant_id = auth.tenant_id
     filename = file.filename or "export.csv"
 
-    # Read uploaded bytes and wrap in TextIOWrapper for streaming line processing
-    contents = await file.read()
-    text_stream = io.StringIO(contents.decode("utf-8"))
+    # Stream directly from the underlying spooled temporary file without loading into memory
+    text_stream = io.TextIOWrapper(file.file, encoding="utf-8")
 
     service = ReconciliationService(session)
     run = await service.execute_reconciliation(
