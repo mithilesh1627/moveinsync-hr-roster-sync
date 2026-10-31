@@ -1,6 +1,7 @@
 """Office Master Repository with Bounded TTL Caching"""
 
-from typing import Set, List
+from typing import Set
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -24,8 +25,7 @@ class OfficeRepository:
         )
         result = await self.session.execute(query)
         codes = {row[0].upper() for row in result.all()}
-        
-        # Cache for tenant
+
         office_cache.set(tenant_id, codes)
         return codes
 
@@ -33,20 +33,19 @@ class OfficeRepository:
         self,
         tenant_id: str,
         office_code: str,
-        office_name: str,
-        timezone: str = "Asia/Kolkata",
+        name: str,
+        city: str,
     ) -> Office:
         """Create or register a tenant office, automatically invalidating the cache."""
         office = Office(
             tenant_id=tenant_id,
             office_code=office_code.upper(),
-            office_name=office_name,
-            timezone=timezone,
+            name=name,
+            city=city,
             is_active=True,
         )
         self.session.add(office)
         await self.session.flush()
 
-        # Invalidate cache
         office_cache.invalidate(tenant_id)
         return office

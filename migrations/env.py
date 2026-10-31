@@ -25,9 +25,10 @@ if config.config_file_name is not None:
 target_metadata = Base.metadata
 
 # Set sqlalchemy.url from our settings
-config.set_main_option("sqlalchemy.url", settings.database_sync_url)
-
-
+config.set_main_option(
+    "sqlalchemy.url",
+    settings.database_sync_url.replace("%", "%%"),
+)
 def run_migrations_offline() -> None:
     """Run migrations in 'offline' mode."""
     url = config.get_main_option("sqlalchemy.url")

@@ -33,7 +33,7 @@ class SingleRosterEventSchema(BaseModel):
     event_id: Optional[str] = Field(default=None, description="Optional unique event ID used for idempotency")
     event_type: EventType = Field(..., description="Action: CREATE, UPDATE, or DEACTIVATE")
     employee_id: str = Field(..., min_length=1, max_length=64, description="Unique tenant employee identifier")
-    source_version: int = Field(..., ge=0, description="Monotonically increasing HR version")
+    source_version: int = Field(..., ge=1, description="Monotonically increasing HR version (must be >= 1)")
     source_timestamp: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc),
         description="Event creation timestamp in source system",

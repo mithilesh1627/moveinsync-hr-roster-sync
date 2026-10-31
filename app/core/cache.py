@@ -6,6 +6,7 @@ Staleness bounds: TTL is 300 seconds; local invalidation occurs immediately on o
 """
 
 import time
+import threading
 from typing import Set, Optional, Dict, Tuple, Any
 from collections import OrderedDict
 
@@ -19,34 +20,43 @@ class BoundedTTLCache:
         self._max_entries = max_entries
         self._default_ttl = default_ttl_seconds
         self._cache: OrderedDict[str, Tuple[Any, float]] = OrderedDict()
+        self._lock = threading.Lock()
 
     def get(self, key: str) -> Optional[Any]:
-        now = time.monotonic()
-        if key not in self._cache:
-            return None
-        value, expiry = self._cache[key]
-        if now > expiry:
-            del self._cache[key]
-            return None
-        # Move to end (MRU)
-        self._cache.move_to_end(key)
-        return value
+        with self._lock:
+            now = time.monotonic()
+            if key not in self._cache:
+                return None
+            value, expiry = self._cache[key]
+            if now > expiry:
+                del self._cache[key]
+                return None
+            # Move to end (MRU)
+            self._cache.move_to_end(key)
+            return value
 
     def set(self, key: str, value: Any, ttl_seconds: Optional[float] = None) -> None:
-        now = time.monotonic()
-        expiry = now + (ttl_seconds if ttl_seconds is not None else self._default_ttl)
-        if key in self._cache:
-            self._cache.move_to_end(key)
-        self._cache[key] = (value, expiry)
-        if len(self._cache) > self._max_entries:
-            self._cache.popitem(last=False)  # Evict least recently used (LRU)
+        with self._lock:
+            now = time.monotonic()
+            expiry = now + (ttl_seconds if ttl_seconds is not None else self._default_ttl)
+            if key in self._cache:
+                self._cache.move_to_end(key)
+            self._cache[key] = (value, expiry)
+            if len(self._cache) > self._max_entries:
+                self._cache.popitem(last=False)  # Evict least recently used (LRU)
 
     def invalidate(self, key: str) -> None:
-        if key in self._cache:
-            del self._cache[key]
+        with self._lock:
+            if key in self._cache:
+                del self._cache[key]
 
     def clear(self) -> None:
-        self._cache.clear()
+        with self._lock:
+            self._cache.clear()
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._cache)
 
 
 # Global cache instance for office codes: tenant_id -> Set[str] of valid uppercase office codes

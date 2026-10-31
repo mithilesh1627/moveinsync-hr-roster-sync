@@ -15,6 +15,7 @@ from sqlalchemy import (
     Uuid,
     Text,
     Index,
+    UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
@@ -25,16 +26,10 @@ from app.models.base import Base, utc_now
 class ReconciliationRun(Base):
     __tablename__ = "reconciliation_runs"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        Uuid(as_uuid=True),
-        primary_key=True,
-        default=uuid.uuid4,
-    )
     run_id: Mapped[str] = mapped_column(
         String(64),
-        unique=True,
+        primary_key=True,
         nullable=False,
-        index=True,
     )
     tenant_id: Mapped[str] = mapped_column(
         String(64),
@@ -111,6 +106,7 @@ class ReconciliationStaging(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
     __table_args__ = (
+        UniqueConstraint("run_id", "tenant_id", "employee_id", name="uq_staging_run_tenant_emp"),
         Index("idx_staging_run_tenant_emp", "run_id", "tenant_id", "employee_id"),
         Index("idx_staging_emp_tenant_run", "tenant_id", "employee_id", "run_id"),
     )

@@ -68,7 +68,7 @@ def clean_state():
     reset_mock_downstream()
     office_cache.clear()
     with sync_engine.connect() as conn:
-        conn.execute(text("TRUNCATE TABLE outbox_events, idempotency_keys, reconciliation_runs CASCADE;"))
+        conn.execute(text("TRUNCATE TABLE outbox_events, idempotency_keys, reconciliation_runs, reconciliation_staging CASCADE;"))
         conn.execute(text("DELETE FROM employees WHERE tenant_id IN ('tenant-alpha', 'tenant-beta', 'tenant-isolated');"))
         conn.commit()
     yield

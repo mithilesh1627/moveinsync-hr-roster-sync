@@ -7,6 +7,7 @@ version ordering, deterministic tie-breaking, and transactional outbox event emi
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Tuple
 from pydantic import ValidationError
+from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.employee import Employee
@@ -160,6 +161,8 @@ class RosterService:
                     source_timestamp=event.source_timestamp,
                     record_hash=record_hash,
                     transport_review_required=False,
+                    created_at=func.now(),
+                    updated_at=func.now(),
                 )
                 await self.employee_repo.create(new_emp)
 
@@ -297,10 +300,12 @@ class RosterService:
             if event.manager_id is not None:
                 emp.manager_id = event.manager_id
 
+            previous_status = emp.status
             is_deactivation = False
             if event.event_type == EventType.DEACTIVATE or event.status == EmployeeStatus.INACTIVE:
                 emp.status = "INACTIVE"
-                is_deactivation = True
+                # Emit EMPLOYEE_DEACTIVATED ONLY on actual ACTIVE -> INACTIVE transition
+                is_deactivation = (previous_status == "ACTIVE")
             elif event.status == EmployeeStatus.ACTIVE:
                 emp.status = "ACTIVE"
 
@@ -317,6 +322,7 @@ class RosterService:
                 manager_id=emp.manager_id,
                 status=emp.status,
             )
+            emp.updated_at = func.now()
 
             # Determine Outbox Event Type
             if is_deactivation:
